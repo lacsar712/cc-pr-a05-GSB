@@ -28,6 +28,7 @@ def ensure():
                 sheet text NOT NULL,
                 cyan_mm double precision NOT NULL,
                 magenta_mm double precision NOT NULL,
+                yellow_mm double precision NOT NULL,
                 status text NOT NULL,
                 verdict text NOT NULL DEFAULT '',
                 reason text NOT NULL DEFAULT '',
@@ -35,6 +36,8 @@ def ensure():
                 created_at timestamptz NOT NULL
             )"""
         )
+        # 兼容旧库：补齐黄版列
+        conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS yellow_mm double precision NOT NULL DEFAULT 0.0")
         conn.commit()
 
 
@@ -50,7 +53,7 @@ def claim_once(conn):
            UPDATE jobs SET status = 'running'
            FROM picked
            WHERE jobs.id = picked.id
-           RETURNING jobs.id, jobs.cyan_mm, jobs.magenta_mm"""
+           RETURNING jobs.id, jobs.cyan_mm, jobs.magenta_mm, jobs.yellow_mm"""
     ).fetchone()
     return row
 
@@ -63,7 +66,7 @@ def main():
             if row is None:
                 conn.commit()
             else:
-                verdict, reason = judge(row["cyan_mm"], row["magenta_mm"])
+                verdict, reason = judge(row["cyan_mm"], row["magenta_mm"], row["yellow_mm"])
                 conn.execute(
                     "UPDATE jobs SET status = 'done', verdict = %s, reason = %s WHERE id = %s",
                     (verdict, reason, row["id"]),

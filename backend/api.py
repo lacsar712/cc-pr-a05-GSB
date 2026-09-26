@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from psycopg.rows import dict_row
 
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54394/printreg")
@@ -29,12 +29,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     sheet text NOT NULL,
     cyan_mm double precision NOT NULL,
     magenta_mm double precision NOT NULL,
+    yellow_mm double precision NOT NULL,
     status text NOT NULL,
     verdict text NOT NULL DEFAULT '',
     reason text NOT NULL DEFAULT '',
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS yellow_mm double precision NOT NULL DEFAULT 0.0;
 """
 
 
@@ -47,6 +49,15 @@ class JobIn(BaseModel):
     sheet: str
     cyan_mm: float
     magenta_mm: float
+    # 投递必须附带黄版偏差（毫米），缺少黄版直接退回
+    yellow_mm: float = Field(...)
+
+    @field_validator("yellow_mm", mode="before")
+    @classmethod
+    def yellow_required(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("必须附带黄版偏差毫米")
+        return value
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -78,10 +89,10 @@ def startup():
         if n == 0:
             now = datetime.now(timezone.utc)
             conn.execute(
-                """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by, created_at)
+                """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, yellow_mm, status, verdict, reason, created_by, created_at)
                    VALUES
-                   ('封面-01', 0.05, -0.04, 'pending', '', '', 'printer', %s),
-                   ('内页-09', 0.40, 0.02, 'pending', '', '', 'printer', %s)""",
+                   ('封面-01', 0.05, -0.04, 0.03, 'pending', '', '', 'printer', %s),
+                   ('内页-09', 0.40, 0.02, 0.05, 'pending', '', '', 'printer', %s)""",
                 (now, now),
             )
         conn.commit()
@@ -106,7 +117,7 @@ def login(body: LoginIn):
 def list_jobs(_user: dict = Depends(current_user)):
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            "SELECT id, sheet, cyan_mm, magenta_mm, yellow_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
         ).fetchall()
 
 
@@ -114,10 +125,10 @@ def list_jobs(_user: dict = Depends(current_user)):
 def enqueue(body: JobIn, user: dict = Depends(require_writer)):
     with connect() as conn:
         row = conn.execute(
-            """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, created_by, created_at)
-               VALUES (%s, %s, %s, 'pending', %s, %s)
+            """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, yellow_mm, status, created_by, created_at)
+               VALUES (%s, %s, %s, %s, 'pending', %s, %s)
                RETURNING id, sheet, status, verdict""",
-            (body.sheet.strip(), body.cyan_mm, body.magenta_mm, user["username"], datetime.now(timezone.utc)),
+            (body.sheet.strip(), body.cyan_mm, body.magenta_mm, body.yellow_mm, user["username"], datetime.now(timezone.utc)),
         ).fetchone()
         conn.commit()
     return row
