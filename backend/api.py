@@ -29,12 +29,34 @@ CREATE TABLE IF NOT EXISTS jobs (
     sheet text NOT NULL,
     cyan_mm double precision NOT NULL,
     magenta_mm double precision NOT NULL,
+    yellow_mm double precision NOT NULL,
     status text NOT NULL,
     verdict text NOT NULL DEFAULT '',
     reason text NOT NULL DEFAULT '',
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+"""
+
+# 老库补黄版列；三色偏差入队即锁死，由触发器挡下任何改动
+MIGRATE = """
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS yellow_mm double precision NOT NULL DEFAULT 0;
+ALTER TABLE jobs ALTER COLUMN yellow_mm DROP DEFAULT;
+
+CREATE OR REPLACE FUNCTION lock_job_colors() RETURNS trigger AS $$
+BEGIN
+    IF NEW.cyan_mm IS DISTINCT FROM OLD.cyan_mm
+       OR NEW.magenta_mm IS DISTINCT FROM OLD.magenta_mm
+       OR NEW.yellow_mm IS DISTINCT FROM OLD.yellow_mm THEN
+        RAISE EXCEPTION '三色偏差数值入队已锁死，不可修改';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS jobs_colors_locked ON jobs;
+CREATE TRIGGER jobs_colors_locked BEFORE UPDATE ON jobs
+FOR EACH ROW EXECUTE FUNCTION lock_job_colors();
 """
 
 
@@ -47,6 +69,7 @@ class JobIn(BaseModel):
     sheet: str
     cyan_mm: float
     magenta_mm: float
+    yellow_mm: float | None = None
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -74,14 +97,15 @@ app = FastAPI(title="印刷套准复核台")
 def startup():
     with connect() as conn:
         conn.execute(SCHEMA)
+        conn.execute(MIGRATE)
         n = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
         if n == 0:
             now = datetime.now(timezone.utc)
             conn.execute(
-                """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by, created_at)
+                """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, yellow_mm, status, verdict, reason, created_by, created_at)
                    VALUES
-                   ('封面-01', 0.05, -0.04, 'pending', '', '', 'printer', %s),
-                   ('内页-09', 0.40, 0.02, 'pending', '', '', 'printer', %s)""",
+                   ('封面-01', 0.05, -0.04, 0.03, 'pending', '', '', 'printer', %s),
+                   ('内页-09', 0.40, 0.02, 0.10, 'pending', '', '', 'printer', %s)""",
                 (now, now),
             )
         conn.commit()
@@ -106,18 +130,20 @@ def login(body: LoginIn):
 def list_jobs(_user: dict = Depends(current_user)):
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            "SELECT id, sheet, cyan_mm, magenta_mm, yellow_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
         ).fetchall()
 
 
 @app.post("/api/jobs", status_code=202)
 def enqueue(body: JobIn, user: dict = Depends(require_writer)):
+    if body.yellow_mm is None:
+        raise HTTPException(status_code=400, detail="缺少黄版偏差，直接退回")
     with connect() as conn:
         row = conn.execute(
-            """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, created_by, created_at)
-               VALUES (%s, %s, %s, 'pending', %s, %s)
+            """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, yellow_mm, status, created_by, created_at)
+               VALUES (%s, %s, %s, %s, 'pending', %s, %s)
                RETURNING id, sheet, status, verdict""",
-            (body.sheet.strip(), body.cyan_mm, body.magenta_mm, user["username"], datetime.now(timezone.utc)),
+            (body.sheet.strip(), body.cyan_mm, body.magenta_mm, body.yellow_mm, user["username"], datetime.now(timezone.utc)),
         ).fetchone()
         conn.commit()
     return row
